@@ -6,8 +6,13 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Handler
@@ -45,6 +50,54 @@ class TimerService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastTick = 0L
     private var lastBeep = -1
+    private var lastFix: Location? = null
+    private var gpsRunning = false
+
+    private val locationListener = LocationListener { loc -> onFix(loc) }
+
+    private fun gpsAllowed(): Boolean =
+        cfg.gps && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun startGps() {
+        if (!gpsAllowed() || gpsRunning) return
+        try {
+            getSystemService(LocationManager::class.java).requestLocationUpdates(
+                LocationManager.GPS_PROVIDER, 1000L, 0f, locationListener, Looper.getMainLooper()
+            )
+            gpsRunning = true
+        } catch (_: SecurityException) {
+        } catch (_: IllegalArgumentException) {
+        }
+    }
+
+    private fun stopGps() {
+        if (!gpsRunning) return
+        try { getSystemService(LocationManager::class.java).removeUpdates(locationListener) } catch (_: Exception) {}
+        gpsRunning = false
+        lastFix = null
+    }
+
+    /** Adds the distance since the previous fix, ignoring poor fixes, GPS jitter and jumps. */
+    private fun onFix(loc: Location) {
+        if (!Session.running) { lastFix = null; return }
+        if (loc.hasAccuracy() && loc.accuracy > 25f) return
+        val prev = lastFix
+        if (prev == null) { lastFix = loc; return }
+        val d = prev.distanceTo(loc).toDouble()
+        val dtS = (loc.elapsedRealtimeNanos - prev.elapsedRealtimeNanos) / 1e9
+        if (dtS <= 0) return
+        if (d < 2.0) return                     // standing still / jitter: keep the older point
+        lastFix = loc
+        if (d / dtS > 8.0) return               // faster than a sprint: a GPS jump, skip it
+        Session.distM += d
+        Session.blockDistM += d
+        when (Session.phase) {
+            Phase.RUN -> Session.runDistM += d
+            Phase.WALK -> Session.walkDistM += d
+            else -> {}
+        }
+        Session.gpsOn = true
+    }
 
     private val loop = object : Runnable {
         override fun run() {
@@ -89,11 +142,17 @@ class TimerService : Service() {
         Session.reset()
         Session.cool = cfg.cool
         val n = buildNotification()
+        val gps = gpsAllowed()
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (gps) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIF_ID, n, type)
+        } else if (gps) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         } else {
             startForeground(NOTIF_ID, n)
         }
+        startGps()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "runtimer:session")
@@ -107,6 +166,11 @@ class TimerService : Service() {
 
     private fun enter(phase: Phase) {
         if (Session.phase == Phase.WALK && phase != Phase.WALK) Session.reps++
+        if (Session.phase == Phase.RUN && Session.blockMs > 0) {
+            Session.runSplits.add(Session.blockDistM to Session.blockMs)
+        }
+        Session.blockDistM = 0.0
+        Session.blockMs = 0
         Session.phase = phase
         if (phase == Phase.DONE) {
             complete()
@@ -130,7 +194,9 @@ class TimerService : Service() {
         val dt = t - lastTick
         lastTick = t
         Session.totalMs += dt
+        Session.blockMs += dt
         if (Session.phase == Phase.RUN) Session.runMs += dt
+        if (Session.phase == Phase.WALK) Session.walkMs += dt
         val remain = Session.endAt - t
         val secs = ceil(remain / 1000.0).toInt()
         if (cfg.beeps && secs in 1..3 && secs != lastBeep) {
@@ -144,6 +210,7 @@ class TimerService : Service() {
         if (Session.running) {
             Session.pausedRemain = Session.remainMs()
             Session.running = false
+            lastFix = null
             handler.removeCallbacks(loop)
         } else {
             resumeIfPaused()
@@ -175,6 +242,7 @@ class TimerService : Service() {
         Session.running = false
         Session.pausedRemain = 0
         handler.removeCallbacks(loop)
+        stopGps()
         tones.done()
         vibrate(longArrayOf(0, 200, 100, 200, 100, 450))
         wakeLock?.let { if (it.isHeld) it.release() }
@@ -238,7 +306,10 @@ class TimerService : Service() {
                 .setChronometerCountDown(true)
                 .setWhen(System.currentTimeMillis() + Session.remainMs())
                 .setShowWhen(true)
-                .setContentText("Reps done: ${Session.reps}")
+                .setContentText(
+                    "Reps done: ${Session.reps}" +
+                        if (Session.gpsOn) " · ${fmtDist(Session.distM, cfg.miles)}" else ""
+                )
         } else {
             b.setUsesChronometer(false)
                 .setShowWhen(false)
@@ -258,6 +329,7 @@ class TimerService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(loop)
+        stopGps()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
     }

@@ -43,6 +43,10 @@ class MainActivity : Activity() {
     private lateinit var repsTv: TextView
     private lateinit var runTv: TextView
     private lateinit var totalTv: TextView
+    private lateinit var distTv: TextView
+    private lateinit var runPaceTv: TextView
+    private lateinit var walkPaceTv: TextView
+    private lateinit var splitsTv: TextView
     private lateinit var skipBtn: Button
     private lateinit var mainBtn: Button
     private lateinit var finishBtn: Button
@@ -150,17 +154,23 @@ class MainActivity : Activity() {
         ringBox.addView(mid, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER))
         root.addView(ringBox, LinearLayout.LayoutParams(MATCH_PARENT, dp(300)))
 
-        val stats = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun stat(label: String): TextView {
+        fun statRow(): LinearLayout {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+            return row
+        }
+        fun stat(row: LinearLayout, label: String): TextView {
             val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-            val v = text(26f, fg, cond = true).apply { gravity = Gravity.CENTER; fontFeatureSettings = "tnum" }
+            val v = text(24f, fg, cond = true).apply { gravity = Gravity.CENTER; fontFeatureSettings = "tnum" }
             col.addView(v)
             col.addView(text(11f, muted).apply { text = label.uppercase(); letterSpacing = 0.08f; gravity = Gravity.CENTER })
-            stats.addView(col, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            row.addView(col, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             return v
         }
-        repsTv = stat("Reps done"); runTv = stat("Time running"); totalTv = stat("Total")
-        root.addView(stats, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+        val row1 = statRow()
+        repsTv = stat(row1, "Reps done"); runTv = stat(row1, "Time running"); totalTv = stat(row1, "Total")
+        val row2 = statRow()
+        distTv = stat(row2, "Distance"); runPaceTv = stat(row2, "Run pace"); walkPaceTv = stat(row2, "Walk pace")
 
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         skipBtn = button("Skip") { TimerService.send(this, TimerService.ACTION_SKIP) }
@@ -173,6 +183,9 @@ class MainActivity : Activity() {
 
         hintTv = text(13f, muted).apply { gravity = Gravity.CENTER; setPadding(0, dp(12), 0, 0) }
         root.addView(hintTv, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        splitsTv = text(14f, fg).apply { fontFeatureSettings = "tnum"; setPadding(0, dp(10), 0, 0); setLineSpacing(0f, 1.25f) }
+        root.addView(splitsTv, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         batteryBtn = button("Let Runtimer run in the background (recommended)") { askBattery() }
         root.addView(batteryBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(12) })
@@ -187,6 +200,10 @@ class MainActivity : Activity() {
         root.addView(header("Warm-up & cool-down"))
         toggle(root, "5-minute warm-up walk", cfg.warm) { cfg.warm = it }
         toggle(root, "5-minute cool-down walk (after Finish)", cfg.cool) { cfg.cool = it }
+
+        root.addView(header("Distance"))
+        toggle(root, "Track distance and pace with GPS", cfg.gps) { cfg.gps = it }
+        toggle(root, "Show miles (off for kilometres)", cfg.miles) { cfg.miles = it }
 
         root.addView(header("Cues"))
         toggle(root, "Countdown beeps (last 3 seconds)", cfg.beeps) { cfg.beeps = it }
@@ -251,17 +268,38 @@ class MainActivity : Activity() {
         when (Session.phase) {
             Phase.DONE -> Session.reset()
             Phase.READY -> {
-                if (Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                val need = mutableListOf<String>()
+                if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) {
+                    need.add(Manifest.permission.POST_NOTIFICATIONS)
                 }
-                cfg.save(this)
-                TimerService.send(this, TimerService.ACTION_START)
+                if (cfg.gps && !granted(Manifest.permission.ACCESS_FINE_LOCATION)) {
+                    need.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                    need.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }
+                if (need.isEmpty()) startSession() else requestPermissions(need.toTypedArray(), REQ_START)
             }
             else -> TimerService.send(this, TimerService.ACTION_TOGGLE)
         }
         handler.postDelayed({ render() }, 60)
+    }
+
+    private fun granted(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+    private fun startSession() {
+        cfg.save(this)
+        TimerService.send(this, TimerService.ACTION_START)
+        handler.postDelayed({ render() }, 60)
+    }
+
+    // Start once the permission dialogs are answered, whatever the answers were:
+    // without location the timer still works, just without distance.
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_START && Session.phase == Phase.READY) startSession()
+    }
+
+    companion object {
+        private const val REQ_START = 2
     }
 
     private fun batteryRestricted(): Boolean =
@@ -307,12 +345,31 @@ class MainActivity : Activity() {
                     if (Session.next() == Phase.COOL) "" else " " + fmt(cfg.lenMs(Session.next()))
             }
             hintTv.text = if (p == Phase.DONE)
-                "${Session.reps} run/walk reps, ${fmt(Session.runMs)} spent running."
+                "${Session.reps} run/walk reps, ${fmt(Session.runMs)} spent running" +
+                    (if (Session.gpsOn) ", ${fmtDist(Session.distM, cfg.miles)} in total." else ".")
             else "Lock the phone whenever you like. Controls are in the notification too."
         }
         repsTv.text = Session.reps.toString()
         runTv.text = fmt(Session.runMs)
         totalTv.text = fmt(Session.totalMs)
+
+        val mi = cfg.miles
+        val hasGps = Session.gpsOn
+        distTv.text = if (hasGps) fmtDist(Session.distM, mi) else "–"
+        runPaceTv.text = if (hasGps) fmtPace(Session.runMs, Session.runDistM, mi) else "–"
+        walkPaceTv.text = if (hasGps) fmtPace(Session.walkMs, Session.walkDistM, mi) else "–"
+
+        splitsTv.text = when {
+            p == Phase.READY -> ""
+            !cfg.gps -> ""
+            !hasGps -> "Waiting for GPS… distance starts once your phone has a good fix."
+            else -> {
+                val lines = Session.runSplits.mapIndexed { i, (m, ms) ->
+                    "Run ${i + 1}:  ${fmtDist(m, mi)}  ·  ${fmtPace(ms, m, mi)}"
+                }
+                if (lines.isEmpty()) "" else "RUN SPLITS\n" + lines.joinToString("\n")
+            }
+        }
 
         mainBtn.text = when {
             p == Phase.DONE -> "Again"

@@ -28,6 +28,8 @@ class Config(
     var cool: Boolean,
     var beeps: Boolean,
     var vibrate: Boolean,
+    var gps: Boolean,
+    var miles: Boolean,
 ) {
     fun lenMs(phase: Phase): Long {
         val secs = when (phase) {
@@ -45,6 +47,7 @@ class Config(
             .putInt("run", run).putInt("walk", walk)
             .putBoolean("warm", warm).putBoolean("cool", cool)
             .putBoolean("beeps", beeps).putBoolean("vibrate", vibrate)
+            .putBoolean("gps", gps).putBoolean("miles", miles)
             .apply()
     }
 
@@ -58,6 +61,7 @@ class Config(
                 p.getInt("run", 60), p.getInt("walk", 90),
                 p.getBoolean("warm", true), p.getBoolean("cool", true),
                 p.getBoolean("beeps", true), p.getBoolean("vibrate", true),
+                p.getBoolean("gps", true), p.getBoolean("miles", true),
             )
         }
     }
@@ -76,6 +80,16 @@ object Session {
     var finishing = false
     var cool = true         // whether this session ends with a cool-down
 
+    // GPS distance (metres) and time split by phase
+    var distM = 0.0
+    var runDistM = 0.0
+    var walkDistM = 0.0
+    var walkMs = 0L
+    var blockDistM = 0.0
+    var blockMs = 0L
+    var gpsOn = false       // true once at least one good GPS segment has been counted
+    val runSplits = mutableListOf<Pair<Double, Long>>()   // (metres, ms) for each run block
+
     val active: Boolean get() = phase != Phase.READY && phase != Phase.DONE
 
     fun remainMs(): Long =
@@ -91,7 +105,22 @@ object Session {
     fun reset() {
         phase = Phase.READY; lenMs = 0; endAt = 0; pausedRemain = 0; running = false
         reps = 0; runMs = 0; totalMs = 0; finishing = false
+        distM = 0.0; runDistM = 0.0; walkDistM = 0.0; walkMs = 0; blockDistM = 0.0; blockMs = 0
+        gpsOn = false; runSplits.clear()
     }
+}
+
+private const val METRES_PER_MILE = 1609.344
+
+fun fmtDist(m: Double, miles: Boolean): String =
+    if (miles) "%.2f mi".format(m / METRES_PER_MILE) else "%.2f km".format(m / 1000.0)
+
+/** Pace as m:ss per mile or km; a dash when there isn't enough distance to be meaningful. */
+fun fmtPace(ms: Long, m: Double, miles: Boolean): String {
+    if (m < 30 || ms <= 0) return "–"
+    val unit = if (miles) METRES_PER_MILE else 1000.0
+    val secs = ((ms / 1000.0) / (m / unit)).toInt()
+    return "%d:%02d%s".format(secs / 60, secs % 60, if (miles) "/mi" else "/km")
 }
 
 fun fmt(ms: Long): String {
